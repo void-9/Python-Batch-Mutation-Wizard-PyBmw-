@@ -35,7 +35,7 @@ This method allows for direct installation into PyMOL from the GitHub repository
 
 1.  **Copy the Raw File URL**:
     ```
-    https://raw.githubusercontent.com/void-9/Python-Batch-Mutation-Wizard-PyBmw-/main/pybmw.py
+    https://raw.githubusercontent.com/protmind/Python-Batch-Mutation-Wizard-PyBmw-/main/pybmw.py
     ```
 
 2.  **Install via PyMOL Plugin Manager**:
