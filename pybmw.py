@@ -2,7 +2,7 @@
 #       Python Batch Mutation Wizard (PyBmw)
 #
 # Version: 1.0
-# Author: Abhinav Singh
+# Author: Abhinav Singh, Jayaraman Muthukumaran, ND Yash
 # Date: October 12, 2025
 #
 # Description:
@@ -823,3 +823,4 @@ def __init_plugin__(self=None):
     except Exception as e:
         debug_log(f"Re-detect failed: {e}")
     addmenuitemqt('Python Batch Mutation Wizard (PyBmw)', launch_pybmw_plugin)
+
