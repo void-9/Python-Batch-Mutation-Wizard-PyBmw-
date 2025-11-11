@@ -1,38 +1,79 @@
 ##################################################################
 #       Python Batch Mutation Wizard (PyBmw)
 #
-# Version: 1.0
+# Version: 1.2
 # Author: Abhinav Singh, Jayaraman Muthukumaran, ND Yash
-# Date: October 12, 2025
+# Date: November 12, 2025
 #
 # Description:
-# A PyMOL plugin to perform single or batch mutations with an
-# interactive GUI, visual feedback, advanced PDB/Session export,
-# CSV import, and interactive rotamer sculpting functionality.
+# A PyMOL plugin for quick single/batch mutations with a clean GUI,
+# visual feedback, CSV import, PDB/Session export, optional rotamer
+# sculpting, and one-click SAVES v6 upload.
 ##################################################################
 
 import csv
 import os
+import re
+import sys
+import subprocess
+import webbrowser
+import tempfile
 from collections import defaultdict
 from functools import partial
+
 from pymol import cmd, CmdException
 from pymol.plugins import addmenuitemqt
+
+PYQT_AVAILABLE = True
+REQUESTS_AVAILABLE = False
+BS4_AVAILABLE = False
+
+def _safe_print(msg):
+    try:
+        print(msg)
+    except Exception:
+        pass
+
+def _ensure_module(mod, pip_name=None):
+    pip_name = pip_name or mod
+    try:
+        __import__(mod)
+        return True
+    except Exception:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", pip_name])
+            __import__(mod)
+            return True
+        except Exception as e:
+            _safe_print(f"PyBmw Info: auto-install failed for '{pip_name}': {e}")
+            return False
 
 try:
     from PyQt5.QtWidgets import (
         QDialog, QVBoxLayout, QLabel, QComboBox, QPushButton, QDialogButtonBox,
         QApplication, QGroupBox, QRadioButton, QHBoxLayout, QTableWidget,
         QTableWidgetItem, QHeaderView, QMessageBox, QFileDialog,
-        QAbstractItemView, QSpinBox
+        QAbstractItemView, QSpinBox, QInputDialog, QLineEdit, QTabWidget, QWidget
     )
     from PyQt5.QtCore import Qt
-except ImportError:
-    print("PyBmw Error: PyQt5 not found. This plugin requires a PyMOL build with PyQt.")
+except Exception:
+    PYQT_AVAILABLE = False
+    _safe_print("PyBmw Error: PyQt5 not found. This plugin needs a PyMOL build with Qt.")
+
+if _ensure_module("requests"):
+    REQUESTS_AVAILABLE = True
+    import requests
+if _ensure_module("bs4", "beautifulsoup4"):
+    BS4_AVAILABLE = True
+    from bs4 import BeautifulSoup
+
+SAVES_UPLOAD_ENDPOINT = "https://saves.mbi.ucla.edu/"
+SAVES_BASE_URL = "https://saves.mbi.ucla.edu"
 
 DEBUG_PYBMW = False
 def debug_log(msg):
     if DEBUG_PYBMW:
-        print(f"[PyBmw Debug] {msg}")
+        _safe_print(f"[PyBmw Debug] {msg}")
 
 PYMOL_CAPS = {
     "supports_sculpting": False,
@@ -40,7 +81,6 @@ PYMOL_CAPS = {
 }
 
 def detect_pymol_capabilities():
-    debug_log("Detecting PyMOL capabilities...")
     candidates = ["sculpt_iterations", "wizard_sculpt_cycles"]
     try:
         try:
@@ -48,13 +88,10 @@ def detect_pymol_capabilities():
             PYMOL_CAPS["supports_sculpting"] = True
         except CmdException:
             PYMOL_CAPS["supports_sculpting"] = False
-            debug_log("No 'sculpting' setting available.")
-
         for name in candidates:
             try:
                 cmd.get(name)
                 PYMOL_CAPS["sculpt_setting_name"] = name
-                debug_log(f"Detected sculpt setting: {name}")
                 break
             except CmdException:
                 continue
@@ -104,9 +141,9 @@ class ExportDialog(QDialog):
 class PyBmwPanel(QDialog):
     def __init__(self, parent=None):
         super(PyBmwPanel, self).__init__(parent)
-        self.setWindowTitle("Python Batch Mutation Wizard v1.0")
+        self.setWindowTitle("Python Batch Mutation Wizard")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setMinimumSize(550, 650)
+        self.setMinimumSize(560, 720)
 
         self.residues_to_mutate = set()
         self.original_residues = {}
@@ -115,42 +152,62 @@ class PyBmwPanel(QDialog):
         self.amino_acids = ["ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE","LEU","LYS","MET","PHE","PRO","SER","THR","TRP","TYR","VAL"]
         self.sorted_residue_list = []
         self.step_index = 0
+        self.last_saves_email = "example@email.com"
 
-        self.layout = QVBoxLayout(self)
+        self.main_layout = QVBoxLayout(self)
+        self.tab_widget = QTabWidget()
+        self.mutator_tab = QWidget()
+        self.saves_tab = QWidget()
+        self.about_tab = QWidget()
+        self._create_mutator_tab()
+        self._create_saves_tab()
+        self._create_about_tab()
+        self.tab_widget.addTab(self.mutator_tab, "Mutator")
+        self.tab_widget.addTab(self.saves_tab, "SAVES Validation")
+        self.tab_widget.addTab(self.about_tab, "About")
+        self.main_layout.addWidget(self.tab_widget)
 
-        mode_groupbox = QGroupBox("1. Mutation Mode")
+        if not (REQUESTS_AVAILABLE and BS4_AVAILABLE):
+            self.saves_tab.setEnabled(False)
+            self.tab_widget.setTabText(1, "SAVES (Disabled)")
+            msg = "SAVES upload needs 'requests' and 'beautifulsoup4'. I tried installing them automatically but it didn’t work here."
+            err = QLabel(msg)
+            err.setAlignment(Qt.AlignCenter)
+            self.saves_tab.layout().addWidget(err)
+
+        self.full_reset()
+
+    def _create_mutator_tab(self):
+        self.layout = QVBoxLayout(self.mutator_tab)
+
+        mode_groupbox = QGroupBox("1. Mutation mode")
         mode_layout = QHBoxLayout()
         self.batch_mode_radio = QRadioButton("Batch")
         self.individual_mode_radio = QRadioButton("Individual")
         self.step_mode_radio = QRadioButton("Step-by-Step")
         self.batch_mode_radio.setChecked(True)
-        mode_layout.addWidget(self.batch_mode_radio)
-        mode_layout.addWidget(self.individual_mode_radio)
-        mode_layout.addWidget(self.step_mode_radio)
+        for w in (self.batch_mode_radio, self.individual_mode_radio, self.step_mode_radio):
+            mode_layout.addWidget(w)
         mode_groupbox.setLayout(mode_layout)
 
-        refinement_groupbox = QGroupBox("2. Post-Mutation Refinement")
+        refinement_groupbox = QGroupBox("2. Post-mutation refinement")
         refinement_layout = QHBoxLayout()
         self.refinement_combo = QComboBox()
-        
-        refinement_options = ["Wizard Default Rotamer"]
+        opts = ["Wizard Default Rotamer"]
         if PYMOL_CAPS["supports_sculpting"] and PYMOL_CAPS["sculpt_setting_name"]:
-            refinement_options.append("Sculpt Rotamer")
-        self.refinement_combo.addItems(refinement_options)
-
+            opts.append("Sculpt Rotamer")
+        self.refinement_combo.addItems(opts)
         self.sculpt_cycles_spinbox = QSpinBox()
         self.sculpt_cycles_spinbox.setRange(1, 1000)
         self.sculpt_cycles_spinbox.setValue(10)
-        self.sculpt_cycles_spinbox.setToolTip("Number of sculpting cycles to run for refinement.")
         self.sculpt_cycles_label = QLabel("Cycles:")
-        refinement_layout.addWidget(self.refinement_combo)
-        refinement_layout.addWidget(self.sculpt_cycles_label)
-        refinement_layout.addWidget(self.sculpt_cycles_spinbox)
+        for w in (self.refinement_combo, self.sculpt_cycles_label, self.sculpt_cycles_spinbox):
+            refinement_layout.addWidget(w)
         refinement_groupbox.setLayout(refinement_layout)
 
-        self.info_label = QLabel("Select residues and click 'Add to Selection' or import a CSV.")
+        self.info_label = QLabel("Select residues, then hit 'Add to Selection' or import a CSV.")
 
-        self.batch_group = QGroupBox("Batch Controls")
+        self.batch_group = QGroupBox("Batch controls")
         batch_layout = QVBoxLayout()
         self.batch_aa_dropdown = QComboBox()
         self.batch_aa_dropdown.addItems(self.amino_acids)
@@ -158,17 +215,17 @@ class PyBmwPanel(QDialog):
         batch_layout.addWidget(self.batch_aa_dropdown)
         self.batch_group.setLayout(batch_layout)
 
-        self.individual_group = QGroupBox("Individual & Step-by-Step Controls")
+        self.individual_group = QGroupBox("Individual & step controls")
         individual_layout = QVBoxLayout()
-        self.rotamer_control_group = QGroupBox("Interactive Rotamer Selection")
+
+        self.rotamer_control_group = QGroupBox("Rotamer picker")
         rotamer_layout = QHBoxLayout()
         self.prev_rotamer_button = QPushButton("◀ Previous")
         self.next_rotamer_button = QPushButton("Next ▶")
         self.rotamer_info_label = QLabel("Rotamer: - / -")
         self.rotamer_info_label.setAlignment(Qt.AlignCenter)
-        rotamer_layout.addWidget(self.prev_rotamer_button)
-        rotamer_layout.addWidget(self.rotamer_info_label)
-        rotamer_layout.addWidget(self.next_rotamer_button)
+        for w in (self.prev_rotamer_button, self.rotamer_info_label, self.next_rotamer_button):
+            rotamer_layout.addWidget(w)
         self.rotamer_control_group.setLayout(rotamer_layout)
 
         self.individual_table = QTableWidget()
@@ -186,9 +243,8 @@ class PyBmwPanel(QDialog):
         self.prev_step_button = QPushButton("<< Previous Residue")
         self.apply_step_button = QPushButton("Apply This Mutation")
         self.next_step_button = QPushButton("Next Residue >>")
-        self.step_control_box.addWidget(self.prev_step_button)
-        self.step_control_box.addWidget(self.apply_step_button)
-        self.step_control_box.addWidget(self.next_step_button)
+        for w in (self.prev_step_button, self.apply_step_button, self.next_step_button):
+            self.step_control_box.addWidget(w)
 
         self.button_box = QDialogButtonBox()
         self.import_csv_button = self.button_box.addButton("Import CSV...", QDialogButtonBox.ActionRole)
@@ -223,7 +279,53 @@ class PyBmwPanel(QDialog):
         self.prev_rotamer_button.clicked.connect(self._previous_rotamer)
         self.next_rotamer_button.clicked.connect(self._next_rotamer)
 
-        self.full_reset()
+    def _create_saves_tab(self):
+        saves_layout = QVBoxLayout(self.saves_tab)
+        info = QLabel("Upload to SAVES v6.0 for quick structure checks. You’ll get a browser tab and an email when it’s done.")
+        info.setWordWrap(True)
+        saves_layout.addWidget(info)
+
+        email_group = QGroupBox("Job email")
+        email_layout = QHBoxLayout()
+        email_layout.addWidget(QLabel("Email:"))
+        self.saves_email_input = QLineEdit(self.last_saves_email)
+        email_layout.addWidget(self.saves_email_input)
+        email_group.setLayout(email_layout)
+        saves_layout.addWidget(email_group)
+
+        upload_group = QGroupBox("Upload options")
+        upload_layout = QVBoxLayout()
+        btn_upload_existing = QPushButton("1. Upload Existing PDB File...")
+        btn_upload_existing.clicked.connect(self._upload_existing_pdb)
+        upload_layout.addWidget(btn_upload_existing)
+        btn_upload_current = QPushButton("2. Save & Upload Current PyMOL Structure...")
+        btn_upload_current.clicked.connect(self._save_and_upload_current)
+        upload_layout.addWidget(btn_upload_current)
+        upload_group.setLayout(upload_layout)
+        saves_layout.addWidget(upload_group)
+        saves_layout.addStretch()
+
+    def _create_about_tab(self):
+        about_layout = QVBoxLayout(self.about_tab)
+        about_html = """
+        <b>Python Batch Mutation Wizard (PyBmw)</b><br>
+        <p>Version 1.2 built for folks who want to mutate a bunch of residues without wrestling the CLI. 
+        Pick residues, choose targets, preview rotamers, boom—done. If you like exporting clean PDBs or full PyMOL sessions, that’s in here too.</p>
+        <p>What’s nice:</p>
+        <ul>
+          <li>Batch or one-by-one mutations</li>
+          <li>Simple step mode with rotamer preview</li>
+          <li>CSV import so you don’t click 500 times</li>
+          <li>Export PDB or .pse in one go</li>
+          <li>SAVES v6 upload right from the tab</li>
+        </ul>
+        <p>Credits: Abhinav Singh, Jayaraman Muthukumaran, ND Yash.</p>
+        """
+        label = QLabel(about_html)
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignTop)
+        about_layout.addWidget(label)
+        about_layout.addStretch()
 
     def _residue_sort_key(self, res_tuple):
         model, chain, resi_str = res_tuple
@@ -237,14 +339,12 @@ class PyBmwPanel(QDialog):
             cmd.delete("chain_highlight_*")
         except Exception:
             pass
-
         if self.mutated_residue_info:
             mutated_sele = " or ".join([f"/{r[0]}//{r[1]}/{r[2]}" for r in self.mutated_residue_info.keys()])
             try:
                 cmd.color("cyan", mutated_sele)
             except Exception:
                 pass
-
         self.residues_to_mutate = set()
         self.sorted_residue_list = []
         self.original_residues = {k: v for k, v in self.original_residues.items() if k in self.mutated_residue_info}
@@ -277,7 +377,6 @@ class PyBmwPanel(QDialog):
             cmd.label(selection="all", expression='""')
         except Exception:
             pass
-
         self.residues_to_mutate = set()
         self.sorted_residue_list = []
         self.original_residues = {}
@@ -305,9 +404,9 @@ class PyBmwPanel(QDialog):
         self.rotamer_control_group.setVisible(is_step)
 
         for i in range(self.step_control_box.count()):
-            widget = self.step_control_box.itemAt(i).widget()
-            if widget:
-                widget.setVisible(is_step)
+            w = self.step_control_box.itemAt(i).widget()
+            if w:
+                w.setVisible(is_step)
 
         if is_step:
             self._update_rotamer_label()
@@ -339,7 +438,7 @@ class PyBmwPanel(QDialog):
                 else:
                     self.rotamer_info_label.setText("Rotamer: 1 / 1")
             else:
-                 self.rotamer_info_label.setText("Rotamer: - / -")
+                self.rotamer_info_label.setText("Rotamer: - / -")
         except Exception as e:
             debug_log(f"_update_rotamer_label error: {e}")
             self.rotamer_info_label.setText("Rotamer: Error")
@@ -361,7 +460,8 @@ class PyBmwPanel(QDialog):
     def load_mutations_from_csv(self):
         self.full_reset()
         fileName, _ = QFileDialog.getOpenFileName(self, "Open Mutations CSV", "", "CSV Files (*.csv);;All Files (*)")
-        if not fileName: return
+        if not fileName:
+            return
         all_objects = cmd.get_object_list('(all)')
         if not all_objects:
             QMessageBox.critical(self, "Error", "No molecular objects are loaded in PyMOL.")
@@ -373,7 +473,8 @@ class PyBmwPanel(QDialog):
             with open(fileName, 'r', encoding='utf-8-sig') as csvfile:
                 reader = csv.reader(csvfile)
                 for row in reader:
-                    if len(row) < 2: continue
+                    if len(row) < 2:
+                        continue
                     location, new_aa = row[0].strip(), row[1].strip().upper()
                     if new_aa not in self.amino_acids:
                         not_found.append(f"Row '{','.join(row)}': '{new_aa}' is not a valid amino acid code.")
@@ -414,7 +515,7 @@ class PyBmwPanel(QDialog):
                 return set()
             selected_set = set()
             cmd.iterate('(sele) and polymer', 'selected_set.add((model, chain, resi))', space={'selected_set': selected_set})
-            return set((str(m), str(c), str(r)) for (m,c,r) in selected_set)
+            return set((str(m), str(c), str(r)) for (m, c, r) in selected_set)
         except Exception:
             return set()
 
@@ -441,27 +542,23 @@ class PyBmwPanel(QDialog):
                 cmd.delete("chain_highlight_*")
             except CmdException:
                 pass
-            
             residues_by_chain = defaultdict(list)
             for res_tuple in self.residues_to_mutate:
-                model, chain, resi = res_tuple
-                residues_by_chain[(model, chain)].append(res_tuple)
-
+                residues_by_chain[(res_tuple[0], res_tuple[1])].append(res_tuple)
             if len(residues_by_chain) > 1:
-                highlight_colors = ["yellow", "lightmagenta", "palecyan", "lightorange", "palegreen", "lightblue", "sand", "wheat"]
-                color_index = 0
+                colors = ["yellow", "lightmagenta", "palecyan", "lightorange", "palegreen", "lightblue", "sand", "wheat"]
+                idx = 0
                 for (model, chain), residues in residues_by_chain.items():
-                    color = highlight_colors[color_index % len(highlight_colors)]
-                    color_index += 1
+                    color = colors[idx % len(colors)]
+                    idx += 1
                     sele_name = f"chain_highlight_{model}_{chain}"
                     sele_str = " or ".join([f"/{r[0]}//{r[1]}/{r[2]}" for r in residues])
                     cmd.select(sele_name, sele_str)
                     cmd.color(color, sele_name)
-                    
                     first_res_tuple = sorted(residues, key=self._residue_sort_key)[0]
                     label_sele = f"/{first_res_tuple[0]}//{first_res_tuple[1]}/{first_res_tuple[2]} and name CA"
                     cmd.label(label_sele, f'"Chain {chain}"')
-            elif self.residues_to_mutate:
+            else:
                 sele_str = " or ".join([f"/{r[0]}//{r[1]}/{r[2]}" for r in self.residues_to_mutate])
                 cmd.select("highlight_sele", sele_str)
                 cmd.color("yellow", "highlight_sele")
@@ -476,9 +573,9 @@ class PyBmwPanel(QDialog):
                         self.original_residues[res_tuple] = my_space['resn_list'][0]
                 except Exception:
                     self.original_residues[res_tuple] = "UNK"
-        
+
         self.sorted_residue_list = sorted(list(self.residues_to_mutate), key=self._residue_sort_key)
-        
+
         try:
             self.individual_table.blockSignals(True)
             self.individual_table.setRowCount(len(self.sorted_residue_list))
@@ -490,9 +587,7 @@ class PyBmwPanel(QDialog):
                 combo_box.addItems(self.amino_acids)
                 if res_tuple in self.csv_targets:
                     combo_box.setCurrentText(self.csv_targets[res_tuple])
-                combo_box.currentTextChanged.connect(
-                    partial(self.handle_combobox_change, row)
-                )
+                combo_box.currentTextChanged.connect(partial(self.handle_combobox_change, row))
                 self.individual_table.setCellWidget(row, 1, combo_box)
         except Exception as e:
             debug_log(f"_populate_table GUI error: {e}")
@@ -522,7 +617,6 @@ class PyBmwPanel(QDialog):
             if not self.prepare_mutagenesis_wizard():
                 return False
             wizard = cmd.get_wizard()
-
             if "Sculpt" in self.refinement_combo.currentText() and PYMOL_CAPS["supports_sculpting"]:
                 try:
                     cmd.set("sculpting", 1)
@@ -538,7 +632,6 @@ class PyBmwPanel(QDialog):
                         cmd.set("sculpting", 0)
                     except Exception:
                         pass
-            
             wizard.do_select(selection_string)
             wizard.set_mode(new_aa)
             cmd.refresh_wizard()
@@ -563,7 +656,6 @@ class PyBmwPanel(QDialog):
     def run_all_mutations(self):
         if not self.prepare_mutagenesis_wizard():
             return None
-
         skipped = []
         for row, residue in enumerate(list(self.sorted_residue_list)):
             try:
@@ -574,7 +666,6 @@ class PyBmwPanel(QDialog):
             except Exception as e:
                 debug_log(f"Error during mutation loop: {e}")
                 skipped.append(residue)
-
         self.finalize_and_cleanup(finish_run=True)
         return skipped
 
@@ -583,11 +674,9 @@ class PyBmwPanel(QDialog):
         if num_to_mutate == 0:
             QMessageBox.warning(self, "No Mutations", "No mutations are staged to be applied.")
             return
-
         skipped_mutations = self.run_all_mutations()
         if skipped_mutations is None:
             return
-
         num_skipped = len(skipped_mutations)
         num_succeeded = num_to_mutate - num_skipped
         message = f"{num_succeeded} mutation(s) applied successfully."
@@ -597,16 +686,13 @@ class PyBmwPanel(QDialog):
             QMessageBox.information(self, "Process Complete", message)
         else:
             QMessageBox.warning(self, "Process Failed", message)
-
         self._reset_staged_list()
 
     def apply_single_mutation_step(self):
         if not self.sorted_residue_list or self.step_index >= len(self.sorted_residue_list):
             return
-        
         residue = self.sorted_residue_list[self.step_index]
         new_aa = self.individual_table.cellWidget(self.step_index, 1).currentText()
-
         if self.execute_mutation(residue, new_aa):
             if self.sorted_residue_list:
                 self.prime_wizard_for_step()
@@ -630,16 +716,16 @@ class PyBmwPanel(QDialog):
         except Exception:
             pass
         self.mutated_residue_info[residue] = new_aa
-        
+
         is_step_mode = self.step_mode_radio.isChecked()
-        current_residue_at_index = self.sorted_residue_list[self.step_index] if is_step_mode else None
+        current_residue_at_index = self.sorted_residue_list[self.step_index] if is_step_mode and self.step_index < len(self.sorted_residue_list) else None
 
         if residue in self.residues_to_mutate:
             self.residues_to_mutate.remove(residue)
-        
+
         self._populate_table()
 
-        if is_step_mode:
+        if is_step_mode and current_residue_at_index:
             try:
                 self.step_index = self.sorted_residue_list.index(current_residue_at_index)
             except ValueError:
@@ -662,28 +748,32 @@ class PyBmwPanel(QDialog):
             self.prime_wizard_for_step()
 
     def prime_wizard_from_table_selection(self):
-        if not self.step_mode_radio.isChecked(): return
+        if not self.step_mode_radio.isChecked():
+            return
         selected_rows = self.individual_table.selectionModel().selectedRows()
-        if not selected_rows: return
+        if not selected_rows:
+            return
         self.step_index = selected_rows[0].row()
         self.refresh_panel_view()
         self.prime_wizard_for_step()
 
     def prime_wizard_for_step(self):
-        if not self.step_mode_radio.isChecked() or not self.sorted_residue_list: return
-        if self.step_index >= len(self.sorted_residue_list): return
-        if not self.prepare_mutagenesis_wizard(is_step=True): return
-        
+        if not self.step_mode_radio.isChecked() or not self.sorted_residue_list:
+            return
+        if self.step_index >= len(self.sorted_residue_list):
+            return
+        if not self.prepare_mutagenesis_wizard(is_step=True):
+            return
         residue = self.sorted_residue_list[self.step_index]
         new_aa = self.individual_table.cellWidget(self.step_index, 1).currentText()
-        
         if self.preview_mutation(residue, new_aa):
             self._update_rotamer_label()
         else:
             self.rotamer_info_label.setText("Rotamer: N/A")
 
     def scan_for_steric_clashes(self):
-        if not self.mutated_residue_info: return 0
+        if not self.mutated_residue_info:
+            return 0
         mutated_sele = " or ".join([f"/{r[0]}//{r[1]}/{r[2]}" for r in self.mutated_residue_info.keys()])
         surround_sele = f"byres ({mutated_sele}) around 5"
         try:
@@ -726,85 +816,202 @@ class PyBmwPanel(QDialog):
     def handle_export(self):
         if not self.mutated_residue_info:
             reply = QMessageBox.question(self, "No Mutations Found", "No mutations have been applied yet.\n\nDo you still want to export the current state?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply == QMessageBox.No: return
+            if reply == QMessageBox.No:
+                return
         if self.scan_for_steric_clashes() > 0:
-            reply = QMessageBox.warning(self, "Clash Warning", "Severe steric clashes detected. It is recommended to fix these before exporting.\n\nDo you want to export anyway?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply == QMessageBox.No: return
-        
+            reply = QMessageBox.warning(self, "Clash Warning", "Severe steric clashes detected. It’s better to fix these before exporting.\n\nExport anyway?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.No:
+                return
         all_objects = cmd.get_object_list('(all)')
         if not all_objects:
             QMessageBox.critical(self, "Error", "No objects loaded to export.")
             return
         object_name = all_objects[0]
         export_choice = ExportDialog.get_export_options(self)
-        if not export_choice: return
-        
+        if not export_choice:
+            return
+
         if export_choice == "both":
             folder_path = QFileDialog.getExistingDirectory(self, "Select Directory to Save Files")
             if folder_path:
                 try:
-                    pdb_path = os.path.join(folder_path, f"{object_name}_mutated.pdb")
+                    pdb_file_path = os.path.join(folder_path, f"{object_name}_mutated.pdb")
                     session_path = os.path.join(folder_path, f"{object_name}_mutated.pse")
-                    pdb_saved = self._save_pdb(object_name, file_path=pdb_path)
+                    pdb_saved = self._save_pdb(object_name, file_path=pdb_file_path)
                     session_saved = self._save_session(file_path=session_path)
                     if pdb_saved or session_saved:
                         QMessageBox.information(self, "Success", f"Files saved in:\n{folder_path}")
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Could not save files. Error: {e}")
-        else:
-            saved = False
-            if export_choice == "pdb": saved = self._save_pdb(object_name)
-            elif export_choice == "session": saved = self._save_session()
-            if saved: QMessageBox.information(self, "Success", "File saved successfully.")
+        elif export_choice == "pdb":
+            pdb_path = self._save_pdb(object_name)
+            if pdb_path:
+                QMessageBox.information(self, "Success", f"File saved:\n{pdb_path}")
+        elif export_choice == "session":
+            session_path = self._save_session()
+            if session_path:
+                QMessageBox.information(self, "Success", f"File saved:\n{session_path}")
 
     def _save_pdb(self, object_name, file_path=None):
         fileName = file_path or QFileDialog.getSaveFileName(self, "Save Mutated PDB", f"{object_name}_mutated.pdb", "PDB Files (*.pdb);;All Files (*)")[0]
         if fileName:
             try:
                 cmd.save(fileName, object_name)
-                return True
+                return fileName
             except Exception as e:
                 QMessageBox.critical(self, "PDB Save Error", f"Could not save PDB file. Error: {e}")
-        return False
+        return None
 
     def _save_session(self, file_path=None):
         fileName = file_path or QFileDialog.getSaveFileName(self, "Save PyMOL Session", "mutated_session.pse", "PyMOL Session Files (*.pse);;All Files (*)")[0]
         if fileName:
             try:
                 cmd.save(fileName)
-                return True
+                return fileName
             except Exception as e:
                 QMessageBox.critical(self, "Session Save Error", f"Could not save session file. Error: {e}")
-        return False
+        return None
+
+    def _get_email(self):
+        email = self.saves_email_input.text().strip()
+        if not email:
+            email, ok = QInputDialog.getText(self, "Email Required", "Where should SAVES send the link?", QLineEdit.Normal, self.last_saves_email)
+            if not (ok and email):
+                return None
+        self.last_saves_email = email
+        self.saves_email_input.setText(email)
+        return email
+
+    def _upload_existing_pdb(self):
+        if not (REQUESTS_AVAILABLE and BS4_AVAILABLE):
+            QMessageBox.critical(self, "SAVES Disabled", "Networking deps missing. Try restarting PyMOL; the plugin tries to install them on load.")
+            return
+        email = self._get_email()
+        if not email:
+            return
+        fileName, _ = QFileDialog.getOpenFileName(self, "Select PDB File to Upload", "", "PDB Files (*.pdb);;All Files (*)")
+        if not fileName:
+            return
+        self._upload_to_saves(fileName, email)
+
+    def _save_and_upload_current(self):
+        if not (REQUESTS_AVAILABLE and BS4_AVAILABLE):
+            QMessageBox.critical(self, "SAVES Disabled", "Networking deps missing. Try restarting PyMOL; the plugin tries to install them on load.")
+            return
+        email = self._get_email()
+        if not email:
+            return
+        all_objects = cmd.get_object_list('(all)')
+        if not all_objects:
+            QMessageBox.critical(self, "Error", "No objects are loaded in PyMOL to upload.")
+            return
+        object_name = all_objects[0]
+        temp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb", prefix=f"{object_name}_") as temp_file:
+                temp_path = temp_file.name
+            cmd.save(temp_path, object_name)
+            if os.path.exists(temp_path):
+                self._upload_to_saves(temp_path, email)
+            else:
+                raise IOError("Failed to create temporary file.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to create temporary file for upload.\n{e}")
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception as e:
+                    debug_log(f"Could not remove temporary file: {e}")
+
+    def _upload_to_saves(self, file_path, email):
+        if not os.path.exists(file_path):
+            QMessageBox.critical(self, "SAVES Error", f"File not found at path:\n{file_path}")
+            return
+
+        file_name = os.path.basename(file_path)
+        try:
+            files = {'pdbfile': (file_name, open(file_path, 'rb'), 'application/octet-stream')}
+        except Exception as e:
+            QMessageBox.critical(self, "SAVES Error", f"Error opening file: {e}")
+            return
+
+        payload = {'fname': file_name, 'startjob': 'Run programs', 'EMAIL': email}
+
+        try:
+            session = requests.Session()
+            response = session.post(SAVES_UPLOAD_ENDPOINT, data=payload, files=files, verify=True, timeout=60)
+        except requests.exceptions.RequestException as e:
+            QMessageBox.critical(self, "SAVES Network Error", f"Network error during upload:\n{e}")
+            try:
+                files['pdbfile'][1].close()
+            except Exception:
+                pass
+            return
+        finally:
+            try:
+                files['pdbfile'][1].close()
+            except Exception:
+                pass
+
+        if response.status_code == 200:
+            try:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                job_msg = soup.find('div', class_='msg', string=lambda s: s and 'Job' in s and 'has been created' in s)
+                job_id = None
+                if job_msg:
+                    match = re.search(r'Job (\d+) has been created', job_msg.string)
+                    if match:
+                        job_id = match.group(1)
+                if job_id:
+                    job_url = f"{SAVES_BASE_URL}/?job={job_id}"
+                    try:
+                        webbrowser.open(job_url)
+                        QMessageBox.information(self, "SAVES Upload Success", f"Job {job_id} submitted.\nA browser tab should pop up.\nResults will also be emailed to {email}.")
+                    except Exception:
+                        QMessageBox.information(self, "SAVES Upload Success", f"Job {job_id} submitted.\nOpen this in your browser:\n{job_url}\nResults will also be emailed to {email}.")
+                else:
+                    webbrowser.open(SAVES_BASE_URL)
+                    QMessageBox.warning(self, "SAVES Upload", "Upload completed but couldn’t read the job ID. Opened SAVES homepage. Check your email for the job link.")
+            except Exception as e:
+                QMessageBox.critical(self, "SAVES Parse Error", f"Upload ok, but parsing failed:\n{e}")
+        else:
+            QMessageBox.critical(self, "SAVES Upload Failed", f"HTTP {response.status_code}: {response.reason}")
 
     def reject(self):
-        """Called when the dialog is closed or cancelled."""
         try:
             if cmd.get_wizard():
                 cmd.set_wizard()
         except Exception as e:
             debug_log(f"Error closing wizard on exit: {e}")
-        
         self.finalize_and_cleanup()
         super(PyBmwPanel, self).reject()
 
 def launch_pybmw_plugin():
     global dialog
+    if not PYQT_AVAILABLE:
+        _safe_print("PyBmw launch failed: PyQt5 dependencies not met.")
+        return
+
     parent = None
     try:
         from pymol.Qt import get_parent_window
         parent = get_parent_window()
     except Exception:
-        for widget in QApplication.topLevelWidgets():
-            try:
-                if widget.isWindow() and "PyMOL" in widget.windowTitle():
-                    parent = widget
-                    break
-            except Exception:
-                continue
+        try:
+            for widget in QApplication.topLevelWidgets():
+                try:
+                    if widget.isWindow() and "PyMOL" in widget.windowTitle():
+                        parent = widget
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            parent = None
+
     if dialog is None:
         dialog = PyBmwPanel(parent)
-    
+
     dialog.full_reset(preserve_selection=True)
     initial_selection = dialog.fetch_user_selection()
     if initial_selection:
@@ -818,9 +1025,18 @@ def launch_pybmw_plugin():
         pass
 
 def __init_plugin__(self=None):
+    if not PYQT_AVAILABLE:
+        return
     try:
         detect_pymol_capabilities()
     except Exception as e:
         debug_log(f"Re-detect failed: {e}")
     addmenuitemqt('Python Batch Mutation Wizard (PyBmw)', launch_pybmw_plugin)
 
+if __name__ == "__main__":
+    if PYQT_AVAILABLE:
+        app = QApplication.instance() or QApplication([])
+        launch_pybmw_plugin()
+        app.exec_()
+    else:
+        _safe_print("Cannot run test: PyQt5 not found.")
