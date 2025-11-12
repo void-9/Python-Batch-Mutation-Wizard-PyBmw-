@@ -1,7 +1,7 @@
 #  Python Batch Mutation Wizard (PyBmw)
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-1.0-brightgreen" alt="Version 1.0"/>
+  <img src="https://img.shields.io/badge/Version-1.0-brightgreen" alt="Version 1.2"/>
   <img src="https://img.shields.io/badge/License-MIT-blue" alt="License: MIT"/>
 </p>
 
